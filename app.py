@@ -108,7 +108,8 @@ Text to analyze:
 
 
 def classify_with_llm(text: str) -> float:
-    """Return ai_probability (0-1) from Groq LLM classifier."""
+    """Return ai_probability (0–1) from Groq LLM classifier."""
+    # Truncate to ~1500 tokens to stay within limits
     truncated = text[:6000]
     try:
         response = groq_client.chat.completions.create(
@@ -121,16 +122,72 @@ def classify_with_llm(text: str) -> float:
         raw = response.choices[0].message.content.strip()
         data = json.loads(raw)
         score = float(data["ai_probability"])
-        return max(0.0, min(1.0, score))
+        return max(0.0, min(1.0, score))  # clamp to [0, 1]
     except Exception as e:
         app.logger.error(f"LLM classification failed: {e}")
-        return 0.5
+        return 0.5  # neutral fallback on error
+
+
+# ---------------------------------------------------------------------------
+# Detection Signal 2: Stylometric Heuristics
+# ---------------------------------------------------------------------------
+import re
+import math
+
+def compute_stylometric_score(text: str) -> float:
+    """
+    Compute a 0-1 score toward AI based on three stylometric sub-metrics:
+      1. Sentence-length variance (low variance = AI-like)
+      2. Type-token ratio (low diversity = AI-like)
+      3. Punctuation density (near-average = AI-like)
+    Returns 0.5 as fallback for very short texts (< 3 sentences).
+    """
+    # Split into sentences
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    if len(sentences) < 3:
+        return 0.5  # not enough data
+
+    # 1. Sentence-length variance (normalized)
+    lengths = [len(s.split()) for s in sentences]
+    mean_len = sum(lengths) / len(lengths)
+    variance = sum((l - mean_len) ** 2 for l in lengths) / len(lengths)
+    std_dev = math.sqrt(variance)
+    # AI text: std_dev typically < 5; human text > 8
+    # Normalize: low std_dev → high score
+    sent_score = max(0.0, min(1.0, 1.0 - (std_dev / 15.0)))
+
+    # 2. Type-token ratio (vocabulary diversity)
+    words = re.findall(r'\b\w+\b', text.lower())
+    if len(words) == 0:
+        ttr_score = 0.5
+    else:
+        ttr = len(set(words)) / len(words)
+        # AI text: ttr ~0.5-0.6; human text: more variable, often higher
+        # Low TTR → high score (AI-like)
+        ttr_score = max(0.0, min(1.0, 1.0 - ttr))
+
+    # 3. Punctuation density
+    punct_count = sum(1 for c in text if c in '.,;:!?-()"\' ')
+    total_chars = len(text)
+    if total_chars == 0:
+        punct_score = 0.5
+    else:
+        punct_density = punct_count / total_chars
+        # AI text has moderate, consistent punctuation (~0.15-0.25)
+        # Score high if density is in that "average" range
+        distance_from_avg = abs(punct_density - 0.20)
+        punct_score = max(0.0, min(1.0, 1.0 - (distance_from_avg / 0.20)))
+
+    # Average the three sub-metrics
+    stylo_score = (sent_score + ttr_score + punct_score) / 3.0
+    return round(stylo_score, 4)
 
 
 # ---------------------------------------------------------------------------
 # Label generation
 # ---------------------------------------------------------------------------
 def generate_label(confidence: float) -> tuple[str, str]:
+    """Return (attribution, label_text) based on confidence score."""
     if confidence <= 0.35:
         return (
             "human",
@@ -171,11 +228,19 @@ def submit():
     content_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
 
+    # Signal 1: LLM classifier
     llm_score = classify_with_llm(text)
-    confidence = llm_score
+
+    # Signal 2: Stylometric heuristics
+    stylo_score = compute_stylometric_score(text)
+
+    # Confidence: weighted average per planning.md (0.6 LLM + 0.4 stylo)
+    confidence = round(0.6 * llm_score + 0.4 * stylo_score, 4)
     attribution, label_text = generate_label(confidence)
+
     short_text_warning = len(text.split()) < 80
 
+    # Write to audit log
     log_decision({
         "content_id": content_id,
         "creator_id": creator_id,
@@ -183,7 +248,7 @@ def submit():
         "attribution": attribution,
         "confidence": confidence,
         "llm_score": llm_score,
-        "stylo_score": None,
+        "stylo_score": stylo_score,
         "label_text": label_text,
         "status": "classified",
     })
@@ -191,11 +256,11 @@ def submit():
     response = {
         "content_id": content_id,
         "attribution": attribution,
-        "confidence": round(confidence, 4),
+        "confidence": confidence,
         "label_text": label_text,
         "signals": {
             "llm_score": round(llm_score, 4),
-            "stylo_score": None,
+            "stylo_score": round(stylo_score, 4),
         },
     }
     if short_text_warning:
