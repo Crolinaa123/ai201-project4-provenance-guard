@@ -284,6 +284,48 @@ def status(content_id):
     return jsonify(entry), 200
 
 
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    body = request.get_json(silent=True)
+    if not body or "content_id" not in body or "creator_reasoning" not in body:
+        return jsonify({"error": "Missing required fields: content_id, creator_reasoning"}), 400
+
+    content_id = body["content_id"].strip()
+    creator_reasoning = body["creator_reasoning"].strip()
+
+    # Look up original decision
+    entry = get_entry(content_id)
+    if not entry:
+        return jsonify({"error": "content_id not found"}), 404
+
+    # Don't allow duplicate appeals
+    if entry.get("appeal_id"):
+        return jsonify({"error": "An appeal has already been filed for this content"}), 400
+
+    appeal_id = str(uuid.uuid4())
+    appealed_at = datetime.now(timezone.utc).isoformat()
+
+    # Update audit log entry
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        UPDATE audit_log
+        SET status = 'under_review',
+            appeal_id = ?,
+            appeal_reason = ?,
+            appealed_at = ?
+        WHERE content_id = ?
+    """, (appeal_id, creator_reasoning, appealed_at, content_id))
+    con.commit()
+    con.close()
+
+    return jsonify({
+        "appeal_id": appeal_id,
+        "content_id": content_id,
+        "status": "under_review",
+        "message": "Your appeal has been logged and is under review.",
+    }), 200
+
+
 # ---------------------------------------------------------------------------
 # Init + run
 # ---------------------------------------------------------------------------
